@@ -1,10 +1,16 @@
 from apex import amp
 from tokenizers import ByteLevelBPETokenizer
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+INPUT_DIM = 30000
+OUTPUT_DIM = 24000
 
 src_tokenizer = ByteLevelBPETokenizer()
 tgt_tokenizer = ByteLevelBPETokenizer()
-
-src_tokenizer.train(["../data/ncs_preprocessed_data/train-ncs/code.original_subtoken"], vocab_size=30000, special_tokens=[
+#                                                      train-ncs train-others
+src_tokenizer.train(["../data/ncs_preprocessed_data/train-others/code.original_subtoken"], vocab_size=INPUT_DIM, special_tokens=[
     "<s>",
     "<pad>",
     "</s>",
@@ -12,7 +18,7 @@ src_tokenizer.train(["../data/ncs_preprocessed_data/train-ncs/code.original_subt
     "<mask>"])
 
 
-tgt_tokenizer.train(["../data/ncs_preprocessed_data/train-ncs/javadoc.original"], vocab_size=20000, special_tokens=[
+tgt_tokenizer.train(["../data/ncs_preprocessed_data/train-others/javadoc.original"], vocab_size=OUTPUT_DIM, special_tokens=[
     "<s>",
     "<pad>",
     "</s>",
@@ -62,8 +68,8 @@ class LazyDataset(Dataset):
     def __len__(self):
         return self.num_entries
 
-train_dataset = LazyDataset(src_tokenizer, tgt_tokenizer, '../data/ncs_preprocessed_data/train-ncs/code.original_subtoken',
-                            '../data/ncs_preprocessed_data/train-ncs/javadoc.original')
+train_dataset = LazyDataset(src_tokenizer, tgt_tokenizer, '../data/ncs_preprocessed_data/train-others/code.original_subtoken',
+                            '../data/ncs_preprocessed_data/train-others/javadoc.original')
 
 
 
@@ -459,23 +465,18 @@ class Seq2Seq(nn.Module):
         
         return output, attention
 
-    
-
-
-INPUT_DIM = 30000
-OUTPUT_DIM = 20000
 
 
 
-HID_DIM = 256
+HID_DIM = 512
 ENC_LAYERS = 6
 DEC_LAYERS = 6
 ENC_HEADS = 8
 DEC_HEADS = 8
 ENC_PF_DIM = 512
 DEC_PF_DIM = 512
-ENC_DROPOUT = 0.1
-DEC_DROPOUT = 0.1
+ENC_DROPOUT = 0.2
+DEC_DROPOUT = 0.2
 
 enc = Encoder(INPUT_DIM, 
               HID_DIM, 
@@ -507,7 +508,7 @@ def initialize_weights(m):
 
 model.apply(initialize_weights)
 #LEARNING_RATE = 0.0005
-LEARNING_RATE = 0.00005
+LEARNING_RATE = 0.000005
 
 optimizer = torch.optim.Adam(model.parameters(), lr = LEARNING_RATE)
 criterion = nn.CrossEntropyLoss(ignore_index = 1)
@@ -570,7 +571,7 @@ def evaluate(model,dataset,criterion):
         
     return epoch_loss / len(dataset)
 
-def give_pred(model, tokens, device, max_len=50):
+def give_pred(model, tokens, device, max_len=MAX_TGT_LEN):
     model.eval()
     
     src_indexes = tokens
@@ -588,7 +589,7 @@ def give_pred(model, tokens, device, max_len=50):
     
     for i in range(max_len):
         #print(len(trg_indexes),len(trg_indexes[0]))
-        #trg_tensor = torch.LongTensor(pad_sequences(trg_indexes, 50)).unsqueeze(0).to(device)
+        #trg_tensor = torch.LongTensor(pad_sequences(trg_indexes, MAX_TGT_LEN)).unsqueeze(0).to(device)
         trg_tensor = torch.LongTensor(trg_indexes).to(device)
         #print("in loop", trg_tensor.size())
         trg_mask = model.make_trg_mask(trg_tensor)
@@ -597,8 +598,6 @@ def give_pred(model, tokens, device, max_len=50):
             output, attention = model.decoder(trg_tensor, enc_src, trg_mask, src_mask)
         
         #print("out shape", output.size())
-        
-        
         
         for idx in range(len(trg_indexes)):
             #print("shape here = ", output[i][-1].size())
@@ -616,17 +615,20 @@ def give_pred(model, tokens, device, max_len=50):
     #print(len(trg_indexes),len(trg_indexes[0]))
     return trg_indexes
 
-def calculate_blue(model,test_ds, device, max_len = 50):
+def calculate_blue(model,test_ds, device, max_len = MAX_TGT_LEN):
     model.eval()
+    from google_bleu import compute_bleu
     sum_blue = 0
     data_count = 0
     for (src_, trg_) in tqdm(test_ds):
-        hypothesis = give_pred(model,src_, device, max_len = 50)
+        hypothesis = give_pred(model,src_, device, max_len = MAX_TGT_LEN)
         reference = trg_.tolist()
+        sum_blue +=compute_bleu([reference], hypothesis, smooth=True)[0]
+        data_count+=1
         #there may be several references
-        for i in range(src_.size()[0]):
-            sum_blue += nltk.translate.bleu_score.sentence_bleu([reference[i]], hypothesis[i])
-            data_count+=1
+        #for i in range(src_.size()[0]):
+            #sum_blue += nltk.translate.bleu_score.sentence_bleu([reference[i]], hypothesis[i])
+        #    data_count+=1
         #print(sum_blue/data_count)
         #print(data_count)
     return sum_blue/data_count
@@ -638,14 +640,19 @@ warnings.filterwarnings('ignore')
 N_EPOCHS = 300
 CLIP = 1
 
-BATCH_SIZE = 215
-EVAL_BATCH_SIZE = 850
+BATCH_SIZE = 160
+EVAL_BATCH_SIZE = 600
 
 train_dataset = DataLoader(train_dataset, batch_size = BATCH_SIZE, num_workers=5,
                      drop_last=True,
                      shuffle=True)
 
 test_dataset = DataLoader(test_dataset, batch_size = EVAL_BATCH_SIZE, num_workers=5,
+                     drop_last=True,
+                     shuffle=False)
+
+#added this
+bleu_dataset = DataLoader(test_dataset, batch_size = 32, num_workers=5,
                      drop_last=True,
                      shuffle=False)
 
@@ -664,10 +671,9 @@ if __name__ == "__main__":
         return elapsed_mins, elapsed_secs
 
     best_valid_loss = float('inf')
-
     opt_level = 'O1'
+    
     model, optimizer = amp.initialize(model, optimizer, opt_level=opt_level)
-
 
     for epoch in range(N_EPOCHS):
 
@@ -677,7 +683,7 @@ if __name__ == "__main__":
         scheduler.step(train_loss)
         valid_loss = evaluate(model, test_dataset, criterion)
 
-        blue_score = calculate_blue(model,test_dataset, device, max_len = 50)
+        blue_score = calculate_blue(model,bleu_dataset, device, max_len = MAX_TGT_LEN)
         end_time = time.time()
 
         epoch_mins, epoch_secs = epoch_time(start_time, end_time)
@@ -690,7 +696,7 @@ if __name__ == "__main__":
                 'optimizer': optimizer.state_dict(),
                 'amp': amp.state_dict()
             }
-            torch.save(checkpoint, '../models/best_val_text.pt')
+            torch.save(checkpoint, '../models/best_val_no_scheduler.pt')
 
 
         print(f'Epoch: {epoch+1:02} | Time: {epoch_mins}m {epoch_secs}s')
@@ -703,7 +709,39 @@ if __name__ == "__main__":
 
 
 
+'''
+try big lr
+reduce on platue
+Epoch: 94 | Time: 3m 15s
+        Train Loss: 1.080 | Train PPL:   2.943
+         Val. Loss: 4.529 |  Val. PPL:  92.654
+validation blue score =  9.151920398731296
 
+no scheduler
+Epoch: 39 | Time: 3m 19s
+        Train Loss: 2.487 | Train PPL:  12.027
+         Val. Loss: 3.960 |  Val. PPL:  52.468
+validation blue score =  25.177625408480335
+
+with cosine annealing
+
+
+
+restore
+opt_level = 'O1'
+model = Seq2Seq(enc, dec, 1, 1, device).to(device)
+LEARNING_RATE = 0.0005
+
+optimizer = torch.optim.Adam(model.parameters(), lr = LEARNING_RATE)
+
+checkpoint = torch.load('../models/big_checkpoint_corrected_600_loss1.pt')
+
+model, optimizer = amp.initialize(model, optimizer, opt_level=opt_level)
+model.load_state_dict(checkpoint['model'])
+optimizer.load_state_dict(checkpoint['optimizer'])
+amp.load_state_dict(checkpoint['amp'])
+
+'''
 
 
 
